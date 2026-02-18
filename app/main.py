@@ -20,13 +20,26 @@ from pydantic import BaseModel
 from bson.objectid import ObjectId
 from app.database import get_reports_collection, MONGO_URI
 from app.scanner import scan_code, scan_directory
-from app.llm_service import enrich_vulnerabilities
+from app.crawler import crawl_site
+from app.fuzzing_engine import fuzz_from_crawler_output
+from app.llm_service import enrich_vulnerabilities, explain_attack_finding
 from app.pdf_service import generate_pdf
 from app.utils import validate_github_url, download_github_repo, cleanup_temp_directory
 
 
 class ScanRepoRequest(BaseModel):
     repo_url: str
+
+
+class CrawlRequest(BaseModel):
+    target_url: str
+
+
+class AttackExplanationResponse(BaseModel):
+    executive_summary: str
+    technical_explanation: str
+    exploitation_scenario: str
+    recommended_mitigation: str
 
 
 app = FastAPI()
@@ -280,6 +293,93 @@ async def scan_repo_endpoint(request: ScanRepoRequest, background_tasks: Backgro
         "vulnerabilities": scan_result["vulnerabilities"],
         "report_id": report_id
     }
+
+
+@app.post("/crawl")
+async def crawl_endpoint(request: CrawlRequest):
+    target_url = (request.target_url or "").strip()
+    if not target_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="target_url is required",
+        )
+
+    try:
+        return await crawl_site(target_url, max_depth=2)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except Exception as exc:
+        print(f"Crawl error: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to crawl target URL",
+        ) from exc
+
+
+@app.post("/fuzz")
+async def fuzz_endpoint(crawler_output: Dict[str, Any]):
+    if not crawler_output:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Crawler output JSON is required",
+        )
+
+    try:
+        return await fuzz_from_crawler_output(crawler_output)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except Exception as exc:
+        print(f"Fuzzing error: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to execute fuzzing engine",
+        ) from exc
+
+
+@app.post("/explain-attack", response_model=AttackExplanationResponse)
+async def explain_attack_endpoint(payload: Dict[str, Any]):
+    if not payload:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Fuzz finding JSON is required",
+        )
+
+    finding = payload.get("finding") if isinstance(payload.get("finding"), dict) else payload
+    if not isinstance(finding, dict) or not finding:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide a fuzz finding object (or {'finding': {...}}).",
+        )
+
+    try:
+        explanation = await explain_attack_finding(finding)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except RuntimeError as exc:
+        detail = str(exc) or "Failed to generate attack explanation"
+        status_code = (
+            status.HTTP_503_SERVICE_UNAVAILABLE
+            if "OPENAI_API_KEY" in detail
+            else status.HTTP_502_BAD_GATEWAY
+        )
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+    except Exception as exc:
+        print(f"Explain attack error: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate attack explanation",
+        ) from exc
+
+    return AttackExplanationResponse(**explanation)
 
 
 @app.get("/history")

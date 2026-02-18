@@ -1,0 +1,438 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Flow Graph - SecureCode AI</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root{
+      --bg:#0f1724;
+      --panel:#07162a;
+      --panel-2:#081f2f;
+      --line:#12344f;
+      --text:#e6eef8;
+      --muted:#a9bfd6;
+      --blue:#2f7ed8;
+      --orange:#f29f38;
+      --red:#df4a4a;
+      --ok:#7dd3fc;
+    }
+    *{box-sizing:border-box}
+    body{font-family:Inter,Arial;margin:0;background:var(--bg);color:var(--text)}
+    .nav{background:#061426;padding:12px 20px;display:flex;gap:14px}
+    .nav a{color:#9fd0ff;text-decoration:none}
+    .container{max-width:1280px;margin:0 auto;padding:18px}
+    .controls{display:grid;grid-template-columns:minmax(260px,1fr) auto auto;gap:10px;align-items:center}
+    .controls input,.controls button{height:42px;border:1px solid var(--line);border-radius:8px;background:#0d2238;color:var(--text);padding:0 12px}
+    .controls button{cursor:pointer;font-weight:600}
+    .controls label{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:14px}
+    .status{margin-top:10px;color:var(--muted);min-height:20px}
+    .layout{margin-top:14px;display:grid;grid-template-columns:2fr 1fr;gap:14px}
+    .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+    .panel h3{margin:0;padding:12px 14px;border-bottom:1px solid var(--line);font-size:15px}
+    .graph-wrap{height:68vh;min-height:420px;position:relative}
+    #graph{width:100%;height:100%}
+    .legend{position:absolute;right:10px;top:10px;background:#061426cc;border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:12px}
+    .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px}
+    .details{padding:12px 14px;font-size:14px;line-height:1.45;max-height:68vh;overflow:auto}
+    .kv{margin:8px 0}
+    .pill{display:inline-block;background:#10324b;border:1px solid #194a6e;color:#b8dbff;border-radius:999px;padding:2px 8px;margin:0 6px 6px 0;font-size:12px}
+    .vuln{background:var(--panel-2);border:1px solid #194a6e;border-radius:8px;padding:8px;margin-bottom:8px}
+    .small{font-size:12px;color:var(--muted)}
+    .err{color:#ff9696}
+    @media (max-width:980px){
+      .layout{grid-template-columns:1fr}
+      .graph-wrap,.details{max-height:none}
+    }
+    @media (max-width:720px){
+      .controls{grid-template-columns:1fr}
+      .controls button{width:100%}
+    }
+  </style>
+</head>
+<body>
+  <div class="nav">
+    <a href="/static/index.html">Scan</a>
+    <a href="/static/history.html">History</a>
+    <a href="/static/flow.html">Flow</a>
+  </div>
+  <div class="container">
+    <div class="controls">
+      <input id="target-url" type="url" placeholder="https://example.com" />
+      <button id="run">Crawl & Visualize</button>
+      <label><input id="overlay" type="checkbox" checked /> Run /fuzz overlay</label>
+    </div>
+    <div id="status" class="status"></div>
+
+    <div class="layout">
+      <div class="panel">
+        <h3>Application Flow Graph</h3>
+        <div class="graph-wrap">
+          <svg id="graph" aria-label="Flow Graph"></svg>
+          <div class="legend">
+            <div><span class="dot" style="background:var(--blue)"></span>Normal</div>
+            <div><span class="dot" style="background:var(--orange)"></span>Vulnerability Node</div>
+            <div><span class="dot" style="background:var(--red)"></span>Stored Chain Node</div>
+          </div>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>Node Details</h3>
+        <div id="details" class="details">Click a node to inspect URL, parameters, and vulnerabilities.</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const statusEl = document.getElementById("status");
+    const detailsEl = document.getElementById("details");
+    const svgEl = document.getElementById("graph");
+    const overlayEl = document.getElementById("overlay");
+    const targetUrlEl = document.getElementById("target-url");
+    let currentGraph = null;
+    let currentFuzz = null;
+    let currentNodeVulns = new Map();
+    let currentReflections = new Map();
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function normalizeUrl(url) {
+      try {
+        const u = new URL(String(url || ""));
+        u.hash = "";
+        u.search = "";
+        return u.toString().replace(/\/$/, "");
+      } catch (_) {
+        return String(url || "").trim();
+      }
+    }
+
+    async function parseJsonResponse(res) {
+      let body = {};
+      try {
+        body = await res.json();
+      } catch (_) {
+        body = {};
+      }
+      if (!res.ok) throw new Error(body.detail || "Request failed");
+      return body;
+    }
+
+    function flowGraphFallback(crawlData) {
+      const pages = Array.isArray(crawlData?.pages) ? crawlData.pages : [];
+      const nodes = pages.map((p) => ({
+        url: p.url,
+        depth: p.depth || 0,
+        response_type: p.response_type || "unknown",
+        parameters: Array.isArray(p.query_parameters) ? p.query_parameters : []
+      }));
+      const edges = [];
+      for (const page of pages) {
+        const src = page?.url;
+        if (!src) continue;
+        const links = Array.isArray(page.internal_links) ? page.internal_links : [];
+        for (const dst of links) {
+          edges.push({
+            source_url: src,
+            destination_url: dst,
+            parameter_name: "",
+            method: "GET",
+            example_value: ""
+          });
+        }
+      }
+      return { nodes, edges };
+    }
+
+    function buildNodeVulnerabilityMap(fuzzData) {
+      const map = new Map();
+      const findings = Array.isArray(fuzzData?.findings) ? fuzzData.findings : [];
+
+      for (const f of findings) {
+        const key = normalizeUrl(f.target_url);
+        if (!map.has(key)) map.set(key, []);
+        map.get(key).push(f);
+
+        const chains = Array.isArray(f.flow_chain_evidence) ? f.flow_chain_evidence : [];
+        for (const chain of chains) {
+          const path = Array.isArray(chain.path) ? chain.path : [];
+          for (const nodeUrl of path) {
+            const k = normalizeUrl(nodeUrl);
+            if (!map.has(k)) map.set(k, []);
+            map.get(k).push(f);
+          }
+        }
+      }
+      return map;
+    }
+
+    function buildReflectionMap(fuzzData) {
+      const map = new Map();
+      const reflections = Array.isArray(fuzzData?.cross_page_reflections) ? fuzzData.cross_page_reflections : [];
+      for (const r of reflections) {
+        const sourceKey = normalizeUrl(r.source);
+        const sinkKey = normalizeUrl(r.sink);
+        if (!map.has(sourceKey)) map.set(sourceKey, []);
+        if (!map.has(sinkKey)) map.set(sinkKey, []);
+        map.get(sourceKey).push({ ...r, role: "source" });
+        map.get(sinkKey).push({ ...r, role: "sink" });
+      }
+      return map;
+    }
+
+    function classifyNode(url, fuzzData) {
+      const norm = normalizeUrl(url);
+      const reflections = Array.isArray(fuzzData?.cross_page_reflections) ? fuzzData.cross_page_reflections : [];
+      const reflectionSet = new Set();
+      for (const r of reflections) {
+        reflectionSet.add(normalizeUrl(r.source));
+        reflectionSet.add(normalizeUrl(r.sink));
+        const chain = Array.isArray(r.flow_chain) ? r.flow_chain : [];
+        for (const n of chain) reflectionSet.add(normalizeUrl(n));
+      }
+
+      if (reflectionSet.has(norm)) return "stored";
+      if (currentNodeVulns.has(norm) && currentNodeVulns.get(norm).length) return "vuln";
+      return "normal";
+    }
+
+    function renderNodeDetails(node) {
+      if (!node) {
+        detailsEl.innerHTML = "Click a node to inspect URL, parameters, and vulnerabilities.";
+        return;
+      }
+
+      const norm = normalizeUrl(node.url);
+      const vulnerabilities = currentNodeVulns.get(norm) || [];
+      const reflections = currentReflections.get(norm) || [];
+      const params = Array.isArray(node.parameters) ? node.parameters : [];
+
+      const paramsHtml = params.length
+        ? params.map((p) => `<span class="pill">${escapeHtml(p)}</span>`).join("")
+        : `<span class="small">No parameters found.</span>`;
+
+      const vulnHtml = vulnerabilities.length
+        ? vulnerabilities.map((v) => `
+            <div class="vuln">
+              <div><b>${escapeHtml(v.vulnerability_type || "Potential issue")}</b></div>
+              <div class="small">severity=${escapeHtml(v.severity || "Info")} | confidence=${escapeHtml(v.confidence_score ?? "-")}</div>
+              ${v.payload ? `<div class="small">payload: <code>${escapeHtml(v.payload)}</code></div>` : ""}
+              ${v.evidence_snippet ? `<div class="small">${escapeHtml(v.evidence_snippet)}</div>` : ""}
+            </div>
+          `).join("")
+        : `<div class="small">No vulnerabilities mapped to this node.</div>`;
+
+      const reflectionHtml = reflections.length
+        ? reflections.map((r) => {
+            const flowChain = Array.isArray(r.flow_chain) ? r.flow_chain : [];
+            return `
+              <div class="vuln">
+                <div><b>Stored Reflection Candidate (${escapeHtml(r.role)})</b></div>
+                <div class="small">payload=${escapeHtml(r.payload_marker || "-")} | status=${escapeHtml(r.response_status ?? "-")}</div>
+                ${flowChain.length ? `<div class="small">flow: ${escapeHtml(flowChain.join(" -> "))}</div>` : ""}
+              </div>
+            `;
+          }).join("")
+        : `<div class="small">No stored-chain reflections on this node.</div>`;
+
+      detailsEl.innerHTML = `
+        <div class="kv"><b>URL</b><br>${escapeHtml(node.url)}</div>
+        <div class="kv"><b>Depth</b>: ${escapeHtml(node.depth ?? 0)} | <b>Type</b>: ${escapeHtml(node.response_type || "unknown")}</div>
+        <div class="kv"><b>Parameters</b><br>${paramsHtml}</div>
+        <div class="kv"><b>Vulnerabilities Detected</b></div>
+        ${vulnHtml}
+        <div class="kv"><b>Stored Vulnerability Chains</b></div>
+        ${reflectionHtml}
+      `;
+    }
+
+    function renderGraph(flowGraph, fuzzData) {
+      const graph = flowGraph && Array.isArray(flowGraph.nodes) ? flowGraph : { nodes: [], edges: [] };
+      const nodes = graph.nodes.map((n) => ({
+        ...n,
+        id: n.url,
+        status: classifyNode(n.url, fuzzData)
+      }));
+      const nodeById = new Map(nodes.map((n) => [n.id, n]));
+      const links = (graph.edges || [])
+        .map((e) => ({
+          source: e.source_url,
+          target: e.destination_url,
+          parameter_name: e.parameter_name || "",
+          method: e.method || "GET"
+        }))
+        .filter((e) => nodeById.has(e.source) && nodeById.has(e.target));
+
+      const width = svgEl.clientWidth || 900;
+      const height = svgEl.clientHeight || 560;
+      const svg = d3.select(svgEl);
+      svg.selectAll("*").remove();
+      svg.attr("viewBox", `0 0 ${width} ${height}`);
+
+      const defs = svg.append("defs");
+      defs.append("marker")
+        .attr("id", "arrow")
+        .attr("viewBox", "0 -5 10 10")
+        .attr("refX", 20)
+        .attr("refY", 0)
+        .attr("markerWidth", 6)
+        .attr("markerHeight", 6)
+        .attr("orient", "auto")
+        .append("path")
+        .attr("d", "M0,-5L10,0L0,5")
+        .attr("fill", "#3d78b0");
+
+      const root = svg.append("g");
+      const zoom = d3.zoom().scaleExtent([0.35, 3]).on("zoom", (event) => root.attr("transform", event.transform));
+      svg.call(zoom);
+
+      const link = root.append("g")
+        .attr("stroke", "#3d78b0")
+        .attr("stroke-opacity", 0.8)
+        .selectAll("line")
+        .data(links)
+        .enter()
+        .append("line")
+        .attr("stroke-width", 1.4)
+        .attr("marker-end", "url(#arrow)");
+
+      const linkLabel = root.append("g")
+        .selectAll("text")
+        .data(links.filter((l) => l.parameter_name))
+        .enter()
+        .append("text")
+        .attr("font-size", 10)
+        .attr("fill", "#9fc5e8")
+        .text((d) => `${d.method}:${d.parameter_name}`);
+
+      const color = (status) => status === "stored" ? "var(--red)" : status === "vuln" ? "var(--orange)" : "var(--blue)";
+
+      const node = root.append("g")
+        .selectAll("circle")
+        .data(nodes)
+        .enter()
+        .append("circle")
+        .attr("r", 11)
+        .attr("fill", (d) => color(d.status))
+        .attr("stroke", "#dbeafe")
+        .attr("stroke-width", 1)
+        .on("click", (_, d) => renderNodeDetails(d))
+        .call(d3.drag()
+          .on("start", (event, d) => {
+            if (!event.active) sim.alphaTarget(0.35).restart();
+            d.fx = d.x;
+            d.fy = d.y;
+          })
+          .on("drag", (event, d) => {
+            d.fx = event.x;
+            d.fy = event.y;
+          })
+          .on("end", (event, d) => {
+            if (!event.active) sim.alphaTarget(0);
+            d.fx = null;
+            d.fy = null;
+          }));
+
+      const labels = root.append("g")
+        .selectAll("text")
+        .data(nodes)
+        .enter()
+        .append("text")
+        .attr("font-size", 11)
+        .attr("fill", "#dbeafe")
+        .attr("dx", 14)
+        .attr("dy", 4)
+        .text((d) => {
+          try {
+            const u = new URL(d.url);
+            return u.pathname && u.pathname !== "/" ? u.pathname : u.hostname;
+          } catch (_) {
+            return d.url;
+          }
+        });
+
+      const sim = d3.forceSimulation(nodes)
+        .force("link", d3.forceLink(links).id((d) => d.id).distance(115).strength(0.65))
+        .force("charge", d3.forceManyBody().strength(-460))
+        .force("center", d3.forceCenter(width / 2, height / 2))
+        .force("collide", d3.forceCollide(26));
+
+      sim.on("tick", () => {
+        link
+          .attr("x1", (d) => d.source.x)
+          .attr("y1", (d) => d.source.y)
+          .attr("x2", (d) => d.target.x)
+          .attr("y2", (d) => d.target.y);
+        node.attr("cx", (d) => d.x).attr("cy", (d) => d.y);
+        labels.attr("x", (d) => d.x).attr("y", (d) => d.y);
+        linkLabel
+          .attr("x", (d) => (d.source.x + d.target.x) / 2)
+          .attr("y", (d) => (d.source.y + d.target.y) / 2);
+      });
+
+      if (nodes.length) renderNodeDetails(nodes[0]);
+    }
+
+    async function runFlow() {
+      const targetUrl = targetUrlEl.value.trim();
+      if (!targetUrl) {
+        statusEl.innerHTML = `<span class="err">Enter a target URL.</span>`;
+        return;
+      }
+      statusEl.textContent = "Crawling target...";
+      detailsEl.textContent = "Loading...";
+      currentFuzz = null;
+      currentNodeVulns = new Map();
+      currentReflections = new Map();
+
+      try {
+        const crawlRes = await fetch("/crawl", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ target_url: targetUrl })
+        });
+        const crawlData = await parseJsonResponse(crawlRes);
+        const flowGraph = crawlData.flow_graph || flowGraphFallback(crawlData);
+        currentGraph = flowGraph;
+
+        if (overlayEl.checked) {
+          statusEl.textContent = "Running fuzz overlay...";
+          const fuzzRes = await fetch("/fuzz", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(crawlData)
+          });
+          currentFuzz = await parseJsonResponse(fuzzRes);
+          currentNodeVulns = buildNodeVulnerabilityMap(currentFuzz);
+          currentReflections = buildReflectionMap(currentFuzz);
+        } else {
+          currentNodeVulns = new Map();
+          currentReflections = new Map();
+        }
+
+        renderGraph(currentGraph, currentFuzz);
+        const nodeCount = Array.isArray(currentGraph.nodes) ? currentGraph.nodes.length : 0;
+        const edgeCount = Array.isArray(currentGraph.edges) ? currentGraph.edges.length : 0;
+        const findingCount = Array.isArray(currentFuzz?.findings) ? currentFuzz.findings.length : 0;
+        statusEl.textContent = `Graph loaded: ${nodeCount} nodes, ${edgeCount} edges${currentFuzz ? `, ${findingCount} findings` : ""}.`;
+      } catch (err) {
+        statusEl.innerHTML = `<span class="err">Failed: ${escapeHtml(err.message || err)}</span>`;
+        detailsEl.textContent = "Unable to render graph.";
+      }
+    }
+
+    document.getElementById("run").addEventListener("click", runFlow);
+    targetUrlEl.addEventListener("keydown", (e) => { if (e.key === "Enter") runFlow(); });
+    window.addEventListener("resize", () => { if (currentGraph) renderGraph(currentGraph, currentFuzz); });
+  </script>
+</body>
+</html>
