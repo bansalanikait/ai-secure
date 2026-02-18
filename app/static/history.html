@@ -1,0 +1,169 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>History - SecureCode AI</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+  <style>
+    body{font-family:Inter,Arial;background:#0f1724;color:#e6eef8;margin:0}
+    .nav{background:#061426;padding:12px 20px;display:flex;gap:12px}
+    .nav a{color:#9fd0ff;text-decoration:none}
+    .container{padding:24px;max-width:1100px;margin:0 auto}
+    .layout{display:grid;grid-template-columns:1fr;gap:16px}
+    .card{background:#07162a;padding:14px;border-radius:8px;border:1px solid #123}
+    .report{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap;margin-bottom:8px}
+    .meta{font-size:14px;opacity:0.92;margin:2px 0}
+    .actions{display:flex;gap:10px;flex-wrap:wrap}
+    .actions button,.actions a{padding:8px 10px;border:1px solid #123;border-radius:6px;background:#0d2238;color:#e6eef8;text-decoration:none;cursor:pointer}
+    .vuln{background:#081f2f;padding:10px;border-radius:6px;border:1px solid #10324b;margin-top:8px}
+    .err{color:#ff8a8a}
+    @media(min-width:900px){.layout{grid-template-columns:1.05fr 1fr}}
+  </style>
+</head>
+<body>
+  <div class="nav"><a href="/static/index.html">Scan</a><a href="/static/history.html">History</a></div>
+  <div class="container">
+    <h2>Scan History</h2>
+    <div class="layout">
+      <div class="card">
+        <h3>Reports</h3>
+        <div id="list"></div>
+      </div>
+      <div class="card">
+        <h3>Report Details</h3>
+        <div id="details">Select a report to view details.</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const listEl = document.getElementById("list");
+    const detailsEl = document.getElementById("details");
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function reportType(report) {
+      return report.type || (report.repo_url ? "repo" : "file");
+    }
+
+    function formatTimestamp(ts) {
+      const d = new Date(ts);
+      return Number.isNaN(d.getTime()) ? String(ts || "-") : d.toLocaleString();
+    }
+
+    function renderList(reports) {
+      if (!Array.isArray(reports) || !reports.length) {
+        listEl.innerHTML = '<div class="card">No reports found.</div>';
+        return;
+      }
+
+      listEl.innerHTML = reports.map((report) => {
+        const type = reportType(report);
+        const vulnerabilities = Array.isArray(report.vulnerabilities) ? report.vulnerabilities : [];
+        const totalFiles = report.total_files || (type === "file" ? 1 : 0);
+        const totalVulns = report.total_vulnerabilities ?? vulnerabilities.length;
+
+        return `
+          <div class="report">
+            <div>
+              <div><b>${escapeHtml(report._id)}</b></div>
+              <div class="meta"><b>Type:</b> ${escapeHtml(type)}</div>
+              <div class="meta"><b>Time:</b> ${escapeHtml(formatTimestamp(report.timestamp))}</div>
+              <div class="meta"><b>Score:</b> ${escapeHtml(report.score ?? "-")} | <b>Grade:</b> ${escapeHtml(report.grade ?? "-")}</div>
+              <div class="meta"><b>Files:</b> ${escapeHtml(totalFiles)} | <b>Vulnerabilities:</b> ${escapeHtml(totalVulns)}</div>
+            </div>
+            <div class="actions">
+              <button data-open-report="${escapeHtml(report._id)}">View Details</button>
+              <a href="/report/${encodeURIComponent(report._id)}/pdf" target="_blank" rel="noopener">Download PDF</a>
+            </div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    function renderVulnerability(v) {
+      return `
+        <div class="vuln">
+          ${v.file ? `<div class="meta"><b>File:</b> ${escapeHtml(v.file)}</div>` : ""}
+          ${v.line ? `<div class="meta"><b>Line:</b> ${escapeHtml(v.line)}</div>` : ""}
+          <div><b>${escapeHtml(v.issue || "Unknown issue")}</b> (${escapeHtml(v.severity || "Unknown")})</div>
+          <div class="meta"><b>Fix:</b> ${escapeHtml(v.recommended_fix || "No recommendation available")}</div>
+        </div>
+      `;
+    }
+
+    async function openReport(reportId) {
+      detailsEl.innerHTML = "Loading report details...";
+      try {
+        const res = await fetch(`/history/${encodeURIComponent(reportId)}`);
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || "Failed to load report details");
+        }
+
+        const type = reportType(data);
+        const vulnerabilities = Array.isArray(data.vulnerabilities) ? data.vulnerabilities : [];
+        const totalFiles = data.total_files || (type === "file" ? 1 : 0);
+        const totalVulns = data.total_vulnerabilities ?? vulnerabilities.length;
+
+        detailsEl.innerHTML = `
+          <div><b>ID:</b> ${escapeHtml(data._id)}</div>
+          <div class="meta"><b>Type:</b> ${escapeHtml(type)}</div>
+          ${data.filename ? `<div class="meta"><b>Filename:</b> ${escapeHtml(data.filename)}</div>` : ""}
+          ${data.repo_url ? `<div class="meta"><b>Repository:</b> ${escapeHtml(data.repo_url)}</div>` : ""}
+          <div class="meta"><b>Time:</b> ${escapeHtml(formatTimestamp(data.timestamp))}</div>
+          <div class="meta"><b>Score:</b> ${escapeHtml(data.score ?? "-")} | <b>Grade:</b> ${escapeHtml(data.grade ?? "-")}</div>
+          <div class="meta"><b>Files:</b> ${escapeHtml(totalFiles)} | <b>Vulnerabilities:</b> ${escapeHtml(totalVulns)}</div>
+          <div class="actions" style="margin-top:12px">
+            <a href="/report/${encodeURIComponent(data._id)}/pdf" target="_blank" rel="noopener">Download PDF</a>
+          </div>
+          <div style="margin-top:12px">
+            ${vulnerabilities.length ? vulnerabilities.map(renderVulnerability).join("") : '<div class="vuln">No vulnerabilities found.</div>'}
+          </div>
+        `;
+
+        const params = new URLSearchParams(window.location.search);
+        params.set("open", data._id);
+        window.history.replaceState({}, "", `${window.location.pathname}?${params.toString()}`);
+      } catch (err) {
+        detailsEl.innerHTML = `<div class="err">Failed to load details: ${escapeHtml(err.message)}</div>`;
+      }
+    }
+
+    async function loadHistory() {
+      listEl.innerHTML = "Loading history...";
+      try {
+        const res = await fetch("/history");
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || "Failed to load history");
+        }
+        renderList(data);
+
+        const openId = new URLSearchParams(window.location.search).get("open");
+        if (openId) {
+          openReport(openId);
+        }
+      } catch (err) {
+        listEl.innerHTML = `<div class="err">History load failed: ${escapeHtml(err.message)}</div>`;
+      }
+    }
+
+    listEl.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-open-report]");
+      if (!button) return;
+      openReport(button.getAttribute("data-open-report"));
+    });
+
+    loadHistory();
+  </script>
+</body>
+</html>

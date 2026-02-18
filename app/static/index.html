@@ -1,0 +1,165 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>SecureCode AI</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+  <style>
+    body{font-family:Inter,Arial;background:#0f1724;color:#e6eef8;margin:0;padding:0}
+    .nav{background:#061426;padding:12px 20px;display:flex;gap:12px}
+    .nav a{color:#9fd0ff;text-decoration:none}
+    .container{padding:24px;max-width:1000px;margin:0 auto}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}
+    .card{background:#07162a;padding:16px;border-radius:8px;margin-bottom:12px;border:1px solid #123}
+    button,input{padding:10px 12px;border-radius:6px;border:1px solid #123;background:#0d2238;color:#e6eef8}
+    button{cursor:pointer}
+    .stack{display:flex;flex-direction:column;gap:10px}
+    .vuln{background:#081f2f;padding:10px;border-radius:6px;margin-top:8px;border:1px solid #10324b}
+    .meta{opacity:0.9;font-size:14px;margin:2px 0}
+    .actions{margin-top:12px;display:flex;gap:12px;flex-wrap:wrap}
+    .actions a{color:#9fd0ff}
+    .err{color:#ff8a8a}
+  </style>
+</head>
+<body>
+  <div class="nav"><a href="/static/index.html">Scan</a><a href="/static/history.html">History</a></div>
+  <div class="container">
+    <div class="grid">
+      <div class="card stack">
+        <h2>Scan File</h2>
+        <input id="file" type="file" />
+        <button id="upload">Scan File</button>
+      </div>
+      <div class="card stack">
+        <h2>Scan GitHub Repository</h2>
+        <input id="repo-url" type="url" placeholder="https://github.com/owner/repo" />
+        <button id="scan-repo">Scan Repo</button>
+      </div>
+    </div>
+    <div id="result"></div>
+  </div>
+
+  <script>
+    const resultEl = document.getElementById("result");
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    async function parseResponse(res) {
+      let payload = {};
+      try {
+        payload = await res.json();
+      } catch (_) {
+        payload = {};
+      }
+      if (!res.ok) {
+        throw new Error(payload.detail || "Request failed");
+      }
+      return payload;
+    }
+
+    function renderIssue(issue) {
+      const filePart = issue.file ? `<div class="meta"><b>File:</b> ${escapeHtml(issue.file)}</div>` : "";
+      const linePart = issue.line ? `<div class="meta"><b>Line:</b> ${escapeHtml(issue.line)}</div>` : "";
+      return `
+        <div class="vuln">
+          ${filePart}
+          ${linePart}
+          <div><b>${escapeHtml(issue.issue || "Unknown issue")}</b> (${escapeHtml(issue.severity || "Unknown")})</div>
+          <div class="meta"><b>Fix:</b> ${escapeHtml(issue.recommended_fix || "No recommendation available")}</div>
+        </div>
+      `;
+    }
+
+    function renderResultCard(data, options = {}) {
+      const vulnerabilities = Array.isArray(data.vulnerabilities) ? data.vulnerabilities : [];
+      const totalFiles = data.total_files_scanned || options.totalFiles || 1;
+      const totalVulns = data.total_vulnerabilities ?? vulnerabilities.length;
+
+      let html = `
+        <div class="card">
+          <h3>${escapeHtml(options.title || "Scan Result")}</h3>
+          ${data.repo_url ? `<div class="meta"><b>Repository:</b> ${escapeHtml(data.repo_url)}</div>` : ""}
+          <div class="meta"><b>Security Score:</b> ${escapeHtml(data.security_score ?? "-")}</div>
+          <div class="meta"><b>Grade:</b> ${escapeHtml(data.grade ?? "-")}</div>
+          <div class="meta"><b>Total Files Scanned:</b> ${escapeHtml(totalFiles)}</div>
+          <div class="meta"><b>Total Vulnerabilities:</b> ${escapeHtml(totalVulns)}</div>
+      `;
+
+      if (!vulnerabilities.length) {
+        html += `<div class="vuln">No vulnerabilities found.</div>`;
+      } else {
+        html += vulnerabilities.map(renderIssue).join("");
+      }
+
+      if (data.report_id) {
+        html += `
+          <div class="actions">
+            <a href="/static/history.html?open=${encodeURIComponent(data.report_id)}">View Report</a>
+            <a href="/report/${encodeURIComponent(data.report_id)}/pdf" target="_blank" rel="noopener">Download PDF</a>
+          </div>
+        `;
+      }
+
+      html += `</div>`;
+      resultEl.innerHTML = html;
+    }
+
+    async function scanFile() {
+      const file = document.getElementById("file").files[0];
+      if (!file) {
+        alert("Choose a file");
+        return;
+      }
+
+      resultEl.innerHTML = `<div class="card">Scanning file...</div>`;
+      const fd = new FormData();
+      fd.append("file", file, file.name);
+
+      try {
+        const res = await fetch("/scan", { method: "POST", body: fd });
+        const data = await parseResponse(res);
+        renderResultCard(data, { title: "File Scan Result", totalFiles: 1 });
+      } catch (err) {
+        resultEl.innerHTML = `<div class="card err">File scan failed: ${escapeHtml(err.message)}</div>`;
+      }
+    }
+
+    async function scanRepo() {
+      const repoUrl = document.getElementById("repo-url").value.trim();
+      if (!repoUrl) {
+        alert("Enter a GitHub repository URL");
+        return;
+      }
+
+      resultEl.innerHTML = `<div class="card">Scanning repository...</div>`;
+      try {
+        const res = await fetch("/scan-repo", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ repo_url: repoUrl }),
+        });
+        const data = await parseResponse(res);
+        renderResultCard(data, { title: "Repository Scan Result" });
+      } catch (err) {
+        resultEl.innerHTML = `<div class="card err">Repo scan failed: ${escapeHtml(err.message)}</div>`;
+      }
+    }
+
+    document.getElementById("upload").addEventListener("click", scanFile);
+    document.getElementById("scan-repo").addEventListener("click", scanRepo);
+    document.getElementById("repo-url").addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        scanRepo();
+      }
+    });
+  </script>
+</body>
+</html>
