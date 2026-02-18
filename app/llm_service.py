@@ -5,9 +5,9 @@ import re
 from typing import List, Dict, Any, Optional
 import httpx
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+MODEL_NAME = os.getenv("MODEL_NAME", "llama3-70b-8192")
 ATTACK_EXPLANATION_KEYS = (
     "executive_summary",
     "technical_explanation",
@@ -21,7 +21,7 @@ async def enrich_vulnerabilities(report_id: str, vulnerabilities: List[Dict[str,
 
     Returns a dict of enrichments or None if API key missing or error.
     """
-    if not OPENAI_API_KEY:
+    if not GROQ_API_KEY:
         print("OPENAI_API_KEY not set; skipping LLM enrichment")
         return None
 
@@ -36,10 +36,10 @@ async def enrich_vulnerabilities(report_id: str, vulnerabilities: List[Dict[str,
             )
             try:
                 resp = await client.post(
-                    OPENAI_API_URL,
-                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                    GROQ_API_URL,
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                     json={
-                        "model": "gpt-3.5-turbo",
+                        "model": "llama3-70b-8192",
                         "messages": [{"role": "user", "content": prompt}],
                         "max_tokens": 300,
                     },
@@ -60,10 +60,10 @@ async def enrich_vulnerabilities(report_id: str, vulnerabilities: List[Dict[str,
                 + "\n".join([f"- {v['issue']} ({v['severity']})" for v in vulnerabilities])
             )
             resp2 = await client.post(
-                OPENAI_API_URL,
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                GROQ_API_URL,
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                 json={
-                    "model": "gpt-3.5-turbo",
+                    "model": "llama3-70b-8192",
                     "messages": [{"role": "user", "content": summary_prompt}],
                     "max_tokens": 150,
                 },
@@ -145,8 +145,8 @@ async def explain_attack_finding(finding: Dict[str, Any]) -> Dict[str, str]:
     if not isinstance(finding, dict) or not finding:
         raise ValueError("A non-empty fuzz finding object is required.")
 
-    if not OPENAI_API_KEY or OPENAI_API_KEY.strip().lower() in {"", "your_openai_api_key_here"}:
-        raise RuntimeError("OPENAI_API_KEY not set.")
+    if not GROQ_API_KEY or GROQ_API_KEY.strip().lower() in {"", "your_groq_api_key_here"}:
+        raise RuntimeError("GROQ_API_KEY not set.")
 
     payload_for_prompt = _prepare_finding_for_prompt(finding)
     prompt = (
@@ -163,7 +163,7 @@ async def explain_attack_finding(finding: Dict[str, Any]) -> Dict[str, str]:
     )
 
     request_json = {
-        "model": OPENAI_MODEL,
+        "model": MODEL_NAME,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.1,
         "max_tokens": 500,
@@ -173,13 +173,13 @@ async def explain_attack_finding(finding: Dict[str, Any]) -> Dict[str, str]:
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
             response = await client.post(
-                OPENAI_API_URL,
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                GROQ_API_URL,
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                 json=request_json,
             )
             response.raise_for_status()
         except Exception as exc:
-            raise RuntimeError("OpenAI request failed.") from exc
+            raise RuntimeError("GROQ request failed.") from exc
 
     content = (
         response.json()
@@ -189,6 +189,6 @@ async def explain_attack_finding(finding: Dict[str, Any]) -> Dict[str, str]:
     )
     parsed = _extract_json_object(str(content))
     if not parsed:
-        raise RuntimeError("OpenAI did not return valid JSON.")
+        raise RuntimeError("GROQ did not return valid JSON.")
 
     return _normalize_attack_explanation(parsed)
