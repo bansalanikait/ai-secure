@@ -329,6 +329,29 @@ def build_flow_graph_from_crawler_output(crawler_output: Dict[str, Any]) -> Flow
                     example_value=example_value,
                 )
 
+        for endpoint in page.get("discovered_endpoints") or []:
+            destination = str(endpoint or "").strip()
+            if not destination:
+                continue
+            query_values = _extract_query_param_values(destination)
+            if query_values:
+                for param_name, examples in query_values.items():
+                    graph.add_edge(
+                        source,
+                        destination,
+                        parameter=param_name,
+                        method="GET",
+                        example_value=str(examples[0] if examples else ""),
+                    )
+            else:
+                graph.add_edge(
+                    source,
+                    destination,
+                    parameter="",
+                    method="GET",
+                    example_value="",
+                )
+
     return graph
 
 

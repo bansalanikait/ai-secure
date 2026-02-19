@@ -726,6 +726,9 @@ async def scan_website_endpoint(request: ScanWebsiteRequest):
     stored_candidates = int(fuzz_output.get("stored_vulnerability_candidates") or 0)
     longest_parameter_chain = fuzz_output.get("longest_parameter_chain") or {}
     cross_page_reflections = fuzz_output.get("cross_page_reflections") or []
+    js_vulnerabilities = (
+        (crawler_output.get("summary") or {}).get("js_vulnerabilities") or {}
+    )
 
     security_score = _calculate_web_security_score(findings_with_explanations)
     grade = _web_grade_from_score(security_score)
@@ -744,6 +747,7 @@ async def scan_website_endpoint(request: ScanWebsiteRequest):
         "stored_vulnerability_candidates": stored_candidates,
         "longest_parameter_chain": longest_parameter_chain,
         "cross_page_reflections": cross_page_reflections,
+        "js_vulnerabilities": js_vulnerabilities,
         "findings": findings_with_explanations,
         "vulnerabilities": [
             _finding_to_pdf_vulnerability(item) for item in findings_with_explanations
@@ -783,6 +787,7 @@ async def scan_website_endpoint(request: ScanWebsiteRequest):
         "stored_vulnerability_candidates": stored_candidates,
         "longest_parameter_chain": longest_parameter_chain,
         "cross_page_reflections": cross_page_reflections,
+        "js_vulnerabilities": js_vulnerabilities,
         "findings": web_response_findings,
     }
 

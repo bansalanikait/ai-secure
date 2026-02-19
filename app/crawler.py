@@ -1,4 +1,5 @@
 import asyncio
+import re
 import time
 from collections import deque
 from html.parser import HTMLParser
@@ -16,6 +17,20 @@ MIN_REQUEST_INTERVAL = 1.0 / MAX_REQUESTS_PER_SECOND
 CRAWLER_USER_AGENT = "ai-secure-crawler/1.0"
 SUPPORTED_SCHEMES = {"http", "https"}
 FIELD_TAGS = {"input", "textarea", "select"}
+JS_STATIC_ASSET_SUFFIXES = (
+    ".js",
+    ".css",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".svg",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".map",
+)
 
 
 def validate_target_url(url: str) -> bool:
@@ -391,6 +406,146 @@ def _extract_page_data(page_url: str, html: str, root_host: str) -> Dict[str, An
     }
 
 
+def analyze_js_content(content: str, source_url: str) -> Dict[str, Any]:
+    """Analyze JavaScript content for risky patterns and API endpoints."""
+    text = str(content or "")
+    findings: List[Dict[str, str]] = []
+    discovered_endpoints: List[str] = []
+    seen_findings: Set[Tuple[str, str, str]] = set()
+
+    def add_finding(
+        finding_type: str, severity: str, message: str, evidence: str
+    ) -> None:
+        compact = re.sub(r"\s+", " ", str(evidence or "")).strip()
+        if len(compact) > 200:
+            compact = f"{compact[:197]}..."
+        signature = (finding_type, message, compact)
+        if signature in seen_findings:
+            return
+        seen_findings.add(signature)
+        findings.append(
+            {
+                "source_url": source_url,
+                "type": finding_type,
+                "severity": severity,
+                "message": message,
+                "evidence": compact,
+            }
+        )
+
+    def iter_limited(pattern: re.Pattern[str], max_hits: int = 20):
+        count = 0
+        for match in pattern.finditer(text):
+            yield match
+            count += 1
+            if count >= max_hits:
+                break
+
+    detection_patterns: List[Tuple[str, str, str, re.Pattern[str]]] = [
+        (
+            "innerhtml_assignment",
+            "Medium",
+            "innerHTML assignment can enable DOM XSS if input is unsanitized.",
+            re.compile(r"\.\s*innerHTML\s*=", re.IGNORECASE),
+        ),
+        (
+            "document_write",
+            "Medium",
+            "document.write usage can introduce script injection risks.",
+            re.compile(r"\bdocument\.write\s*\(", re.IGNORECASE),
+        ),
+        (
+            "eval_usage",
+            "High",
+            "eval usage detected.",
+            re.compile(r"\beval\s*\(", re.IGNORECASE),
+        ),
+        (
+            "settimeout_string",
+            "Medium",
+            "setTimeout called with a string argument.",
+            re.compile(
+                r"\bsetTimeout\s*\(\s*(['\"`])(?:(?!\1).){1,400}\1\s*(?:,|\))",
+                re.IGNORECASE | re.DOTALL,
+            ),
+        ),
+        (
+            "fetch_concat_input",
+            "Medium",
+            "fetch call appears to concatenate dynamic input into URL/body.",
+            re.compile(
+                r"\bfetch\s*\(\s*[^)]{0,500}(?:\+|\$\{)[^)]{0,500}\)",
+                re.IGNORECASE | re.DOTALL,
+            ),
+        ),
+        (
+            "xhr_concat_input",
+            "Medium",
+            "XMLHttpRequest.open appears to concatenate dynamic input into URL.",
+            re.compile(
+                r"\.open\s*\(\s*['\"](?:GET|POST|PUT|PATCH|DELETE|OPTIONS)['\"]\s*,\s*[^,\)]{0,500}(?:\+|\$\{)",
+                re.IGNORECASE | re.DOTALL,
+            ),
+        ),
+        (
+            "hardcoded_secret",
+            "High",
+            "Potential hardcoded API key/token/secret found in JavaScript.",
+            re.compile(
+                r"(?:api[_\-]?key|token|secret|access[_\-]?token)\s*[:=]\s*['\"][A-Za-z0-9_\-\.]{12,}['\"]",
+                re.IGNORECASE,
+            ),
+        ),
+    ]
+
+    for finding_type, severity, message, pattern in detection_patterns:
+        for match in iter_limited(pattern):
+            add_finding(finding_type, severity, message, match.group(0))
+
+    endpoint_literal_pattern = re.compile(
+        r"""(?P<quote>['"`])(?P<endpoint>(?:https?://|//|/)[^'"`\s]{1,280})(?P=quote)""",
+        re.IGNORECASE,
+    )
+    xhr_url_pattern = re.compile(
+        r"""\.open\s*\(\s*['"](?:GET|POST|PUT|PATCH|DELETE|OPTIONS)['"]\s*,\s*(?P<quote>['"`])(?P<endpoint>[^'"`]{1,280})(?P=quote)""",
+        re.IGNORECASE,
+    )
+    fetch_url_pattern = re.compile(
+        r"""\bfetch\s*\(\s*(?P<quote>['"`])(?P<endpoint>[^'"`]{1,280})(?P=quote)""",
+        re.IGNORECASE,
+    )
+
+    def normalize_endpoint(raw_endpoint: str) -> str:
+        endpoint = str(raw_endpoint or "").strip()
+        if not endpoint:
+            return ""
+        endpoint = endpoint.rstrip(".,);")
+        endpoint = re.sub(r"\$\{[^}]+\}", "1", endpoint)
+        endpoint = re.sub(r"\{[^}]+\}", "1", endpoint)
+        if endpoint.lower().startswith(("javascript:", "data:", "mailto:", "tel:")):
+            return ""
+        if endpoint.startswith("//"):
+            parsed_source = urlparse(source_url)
+            endpoint = f"{parsed_source.scheme or 'https'}:{endpoint}"
+        lowered = endpoint.lower()
+        if lowered.endswith(JS_STATIC_ASSET_SUFFIXES):
+            return ""
+        normalized = _normalize_url(urljoin(source_url, endpoint))
+        return normalized
+
+    for pattern in (endpoint_literal_pattern, xhr_url_pattern, fetch_url_pattern):
+        for match in iter_limited(pattern, max_hits=50):
+            endpoint = normalize_endpoint(match.group("endpoint"))
+            if endpoint:
+                discovered_endpoints.append(endpoint)
+
+    return {
+        "source_url": source_url,
+        "findings": findings,
+        "potential_api_endpoints": _unique(discovered_endpoints),
+    }
+
+
 async def crawl_site(target_url: str, max_depth: int = MAX_CRAWL_DEPTH) -> Dict[str, Any]:
     """Crawl a target URL (internal links only) and extract structured metadata."""
     if not validate_target_url(target_url):
@@ -413,6 +568,7 @@ async def crawl_site(target_url: str, max_depth: int = MAX_CRAWL_DEPTH) -> Dict[
     requests_sent = 0
     last_request_time = 0.0
     flow_graph = FlowGraph()
+    js_analysis_cache: Dict[str, Dict[str, Any]] = {}
 
     timeout = httpx.Timeout(20.0, connect=10.0)
     async with httpx.AsyncClient(
@@ -420,6 +576,25 @@ async def crawl_site(target_url: str, max_depth: int = MAX_CRAWL_DEPTH) -> Dict[
         follow_redirects=True,
         headers={"User-Agent": CRAWLER_USER_AGENT},
     ) as client:
+        async def fetch_with_limits(url: str) -> Tuple[Optional[httpx.Response], Optional[str]]:
+            nonlocal requests_sent, last_request_time
+            if requests_sent >= MAX_CRAWL_PAGES:
+                return None, "Request cap reached"
+
+            elapsed = time.monotonic() - last_request_time
+            if last_request_time > 0.0 and elapsed < MIN_REQUEST_INTERVAL:
+                await asyncio.sleep(MIN_REQUEST_INTERVAL - elapsed)
+
+            try:
+                response = await client.get(url)
+                requests_sent += 1
+                last_request_time = time.monotonic()
+                return response, None
+            except httpx.HTTPError as exc:
+                requests_sent += 1
+                last_request_time = time.monotonic()
+                return None, f"Request failed: {exc}"
+
         while queue and requests_sent < MAX_CRAWL_PAGES:
             current_url, depth = queue.popleft()
             current_url = _normalize_url(current_url)
@@ -429,20 +604,13 @@ async def crawl_site(target_url: str, max_depth: int = MAX_CRAWL_DEPTH) -> Dict[
             if current_url in crawled_urls:
                 continue
 
-            elapsed = time.monotonic() - last_request_time
-            if last_request_time > 0.0 and elapsed < MIN_REQUEST_INTERVAL:
-                await asyncio.sleep(MIN_REQUEST_INTERVAL - elapsed)
-
-            try:
-                response = await client.get(current_url)
-                requests_sent += 1
-                last_request_time = time.monotonic()
-            except httpx.HTTPError as exc:
-                requests_sent += 1
-                last_request_time = time.monotonic()
+            response, request_error = await fetch_with_limits(current_url)
+            if response is None:
+                if request_error == "Request cap reached":
+                    break
                 crawled_urls.add(current_url)
                 errors.append(
-                    {"url": current_url, "depth": depth, "error": f"Request failed: {exc}"}
+                    {"url": current_url, "depth": depth, "error": request_error or "Request failed"}
                 )
                 continue
 
@@ -507,6 +675,8 @@ async def crawl_site(target_url: str, max_depth: int = MAX_CRAWL_DEPTH) -> Dict[
                         "query_parameters": query_names,
                         "query_parameters_detailed": query_details,
                         "javascript_files": [],
+                        "js_findings": [],
+                        "discovered_endpoints": [],
                         "internal_links": [],
                         "fuzz_parameters": fuzz_parameters,
                     }
@@ -522,6 +692,75 @@ async def crawl_site(target_url: str, max_depth: int = MAX_CRAWL_DEPTH) -> Dict[
                 continue
 
             extracted = _extract_page_data(final_url, response.text, root_host)
+            page_js_findings: List[Dict[str, str]] = []
+            page_discovered_endpoints: List[str] = []
+
+            for script_url in extracted["javascript_files"]:
+                normalized_script_url = _normalize_url(script_url)
+                if not normalized_script_url:
+                    continue
+
+                cached_analysis = js_analysis_cache.get(normalized_script_url)
+                if cached_analysis is None:
+                    js_response, js_error = await fetch_with_limits(normalized_script_url)
+                    if js_response is None:
+                        if js_error and js_error != "Request cap reached":
+                            errors.append(
+                                {
+                                    "url": normalized_script_url,
+                                    "depth": depth,
+                                    "error": f"JS fetch failed: {js_error}",
+                                }
+                            )
+                        cached_analysis = {
+                            "source_url": normalized_script_url,
+                            "findings": [],
+                            "potential_api_endpoints": [],
+                        }
+                    elif js_response.status_code >= 400:
+                        errors.append(
+                            {
+                                "url": normalized_script_url,
+                                "depth": depth,
+                                "error": f"JS HTTP {js_response.status_code}",
+                            }
+                        )
+                        cached_analysis = {
+                            "source_url": normalized_script_url,
+                            "findings": [],
+                            "potential_api_endpoints": [],
+                        }
+                    else:
+                        cached_analysis = analyze_js_content(
+                            js_response.text, normalized_script_url
+                        )
+                    js_analysis_cache[normalized_script_url] = cached_analysis
+
+                for finding in cached_analysis.get("findings", []):
+                    if isinstance(finding, dict):
+                        page_js_findings.append(dict(finding))
+
+                for endpoint in cached_analysis.get("potential_api_endpoints", []):
+                    normalized_endpoint = _normalize_url(endpoint)
+                    if not normalized_endpoint:
+                        continue
+                    if not _is_internal_url(normalized_endpoint, root_host):
+                        continue
+                    page_discovered_endpoints.append(normalized_endpoint)
+
+            deduped_js_findings: List[Dict[str, str]] = []
+            seen_js_findings: Set[Tuple[str, str, str]] = set()
+            for finding in page_js_findings:
+                source = str(finding.get("source_url") or "")
+                finding_type = str(finding.get("type") or "")
+                evidence = str(finding.get("evidence") or "")
+                signature = (source, finding_type, evidence)
+                if signature in seen_js_findings:
+                    continue
+                seen_js_findings.add(signature)
+                deduped_js_findings.append(finding)
+
+            deduped_endpoints = _unique(page_discovered_endpoints)
             form_parameters: Set[str] = set()
             for form in extracted["forms"]:
                 if not isinstance(form, dict):
@@ -546,6 +785,8 @@ async def crawl_site(target_url: str, max_depth: int = MAX_CRAWL_DEPTH) -> Dict[
                 "query_parameters": extracted["query_parameters"],
                 "query_parameters_detailed": extracted["query_parameters_detailed"],
                 "javascript_files": extracted["javascript_files"],
+                "js_findings": deduped_js_findings,
+                "discovered_endpoints": deduped_endpoints,
                 "internal_links": extracted["internal_links"],
                 "fuzz_parameters": extracted["fuzz_parameters"],
             }
@@ -561,6 +802,29 @@ async def crawl_site(target_url: str, max_depth: int = MAX_CRAWL_DEPTH) -> Dict[
 
             for link in extracted["internal_links"]:
                 destination = _normalize_url(link)
+                if not destination:
+                    continue
+                query_values = _extract_query_param_values(destination)
+                if query_values:
+                    for param_name, values in sorted(query_values.items()):
+                        flow_graph.add_edge(
+                            final_url,
+                            destination,
+                            parameter=param_name,
+                            method="GET",
+                            example_value=str(values[0] if values else ""),
+                        )
+                else:
+                    flow_graph.add_edge(
+                        final_url,
+                        destination,
+                        parameter="",
+                        method="GET",
+                        example_value="",
+                    )
+
+            for endpoint_url in deduped_endpoints:
+                destination = _normalize_url(endpoint_url)
                 if not destination:
                     continue
                 query_values = _extract_query_param_values(destination)
@@ -628,7 +892,10 @@ async def crawl_site(target_url: str, max_depth: int = MAX_CRAWL_DEPTH) -> Dict[
                 continue
 
             next_depth = depth + 1
-            for link in extracted["internal_links"]:
+            crawl_candidates = _unique(
+                extracted["internal_links"] + deduped_endpoints
+            )
+            for link in crawl_candidates:
                 normalized_link = _normalize_url(link)
                 if not normalized_link:
                     continue
@@ -646,6 +913,26 @@ async def crawl_site(target_url: str, max_depth: int = MAX_CRAWL_DEPTH) -> Dict[
     )
     unique_javascript_files = sorted(
         {script for page in pages for script in page.get("javascript_files", [])}
+    )
+    all_js_findings: List[Dict[str, str]] = [
+        finding
+        for page in pages
+        for finding in page.get("js_findings", [])
+        if isinstance(finding, dict)
+    ]
+    js_findings_by_type: Dict[str, int] = {}
+    for finding in all_js_findings:
+        finding_type = str(finding.get("type") or "").strip()
+        if not finding_type:
+            continue
+        js_findings_by_type[finding_type] = js_findings_by_type.get(finding_type, 0) + 1
+    unique_discovered_endpoints = sorted(
+        {
+            endpoint
+            for page in pages
+            for endpoint in page.get("discovered_endpoints", [])
+            if str(endpoint or "").strip()
+        }
     )
     all_fuzz_parameters: Dict[
         Tuple[str, str, str, str, str, bool, str], Dict[str, Any]
@@ -696,6 +983,11 @@ async def crawl_site(target_url: str, max_depth: int = MAX_CRAWL_DEPTH) -> Dict[
             "total_input_fields": sum(len(page.get("input_fields", [])) for page in pages),
             "unique_query_parameters": unique_query_params,
             "javascript_files": unique_javascript_files,
+            "discovered_endpoints": unique_discovered_endpoints,
+            "js_vulnerabilities": {
+                "total_findings": len(all_js_findings),
+                "findings_by_type": dict(sorted(js_findings_by_type.items())),
+            },
             "total_fuzz_parameters": len(all_fuzz_parameters),
             "visited_urls": len(crawled_urls),
         },
