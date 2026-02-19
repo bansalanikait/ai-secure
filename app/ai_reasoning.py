@@ -5,9 +5,9 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = os.getenv("MODEL_NAME", "llama-3.3-70b-versatile")
 AI_REASONING_ANOMALY_THRESHOLD = float(
     os.getenv("AI_REASONING_ANOMALY_THRESHOLD", "0.75")
 )
@@ -23,9 +23,9 @@ ALLOWED_ESCALATION_CATEGORIES = {
 def should_invoke_ai_reasoning(anomaly_score: float, threshold: float) -> bool:
     if threshold <= 0:
         threshold = AI_REASONING_ANOMALY_THRESHOLD
-    if not OPENAI_API_KEY:
+    if not GROQ_API_KEY:
         return False
-    if OPENAI_API_KEY.strip().lower() in {"", "your_openai_api_key_here"}:
+    if GROQ_API_KEY.strip().lower() in {"", "your_groq_api_key_here"}:
         return False
     return anomaly_score >= threshold
 
@@ -70,6 +70,25 @@ def _sanitize_refined_payload(payload: str) -> str:
     return value
 
 
+def _extract_api_error_text(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            err = payload.get("error")
+            if isinstance(err, dict):
+                message = str(err.get("message") or "").strip()
+                code = str(err.get("code") or "").strip()
+                if message and code:
+                    return f"{message} (code={code})"
+                if message:
+                    return message
+        raw = (response.text or "").strip()
+        return raw[:400] if raw else "Unknown error"
+    except Exception:
+        raw = (response.text or "").strip()
+        return raw[:400] if raw else "Unknown error"
+
+
 async def reason_on_anomaly(
     baseline_response: Dict[str, Any],
     fuzz_response: Dict[str, Any],
@@ -79,7 +98,7 @@ async def reason_on_anomaly(
     parameter: str,
     category: str,
 ) -> Optional[Dict[str, Any]]:
-    if not OPENAI_API_KEY or OPENAI_API_KEY.strip().lower() in {"", "your_openai_api_key_here"}:
+    if not GROQ_API_KEY or GROQ_API_KEY.strip().lower() in {"", "your_groq_api_key_here"}:
         return None
 
     baseline_body = _truncate(str(baseline_response.get("body") or ""))
@@ -118,10 +137,13 @@ async def reason_on_anomaly(
     try:
         async with httpx.AsyncClient(timeout=12.0) as client:
             resp = await client.post(
-                OPENAI_API_URL,
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                GROQ_API_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
                 json={
-                    "model": OPENAI_MODEL,
+                    "model": GROQ_MODEL,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.1,
                     "max_tokens": 220,
@@ -134,6 +156,12 @@ async def reason_on_anomaly(
                 .get("message", {})
                 .get("content", "")
             )
+    except httpx.HTTPStatusError as exc:
+        detail = _extract_api_error_text(exc.response)
+        print(
+            f"AI reasoning request failed: HTTP {exc.response.status_code} - {detail}"
+        )
+        return None
     except Exception as exc:
         print(f"AI reasoning request failed: {exc}")
         return None

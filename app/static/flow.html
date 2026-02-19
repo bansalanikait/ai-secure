@@ -24,11 +24,17 @@
     .nav{background:#061426;padding:12px 20px;display:flex;gap:14px}
     .nav a{color:#9fd0ff;text-decoration:none}
     .container{max-width:1280px;margin:0 auto;padding:18px}
-    .controls{display:grid;grid-template-columns:minmax(260px,1fr) auto auto;gap:10px;align-items:center}
+    .controls{display:grid;grid-template-columns:minmax(220px,1fr) minmax(220px,1fr) auto auto auto;gap:10px;align-items:center}
     .controls input,.controls button{height:42px;border:1px solid var(--line);border-radius:8px;background:#0d2238;color:var(--text);padding:0 12px}
     .controls button{cursor:pointer;font-weight:600}
     .controls label{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:14px}
     .status{margin-top:10px;color:var(--muted);min-height:20px}
+    .scan-panel{margin-top:14px}
+    .scan-meta{padding:12px 14px;border-bottom:1px solid var(--line);display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
+    .scan-tile{background:#0a1e33;border:1px solid #173553;border-radius:8px;padding:8px}
+    .scan-findings{padding:12px 14px;max-height:220px;overflow:auto}
+    .scan-actions{padding:0 14px 12px 14px;display:flex;gap:10px;flex-wrap:wrap}
+    .scan-actions a{color:#9fd0ff;text-decoration:none}
     .layout{margin-top:14px;display:grid;grid-template-columns:2fr 1fr;gap:14px}
     .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
     .panel h3{margin:0;padding:12px 14px;border-bottom:1px solid var(--line);font-size:15px}
@@ -40,6 +46,19 @@
     .kv{margin:8px 0}
     .pill{display:inline-block;background:#10324b;border:1px solid #194a6e;color:#b8dbff;border-radius:999px;padding:2px 8px;margin:0 6px 6px 0;font-size:12px}
     .vuln{background:var(--panel-2);border:1px solid #194a6e;border-radius:8px;padding:8px;margin-bottom:8px}
+    .finding-title{font-size:15px;line-height:1.3}
+    .finding-meta{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
+    .finding-meta .pill{margin:0}
+    .payload-list{margin:6px 0 0 14px;padding:0}
+    .payload-list li{margin:3px 0;word-break:break-word}
+    .ai-block{margin-top:8px}
+    .mitigation-box{
+      margin-top:6px;
+      padding:8px;
+      border:1px solid #23b26d;
+      border-radius:8px;
+      background:rgba(35,178,109,0.08);
+    }
     .small{font-size:12px;color:var(--muted)}
     .err{color:#ff9696}
     @media (max-width:980px){
@@ -61,10 +80,18 @@
   <div class="container">
     <div class="controls">
       <input id="target-url" type="url" placeholder="https://example.com" />
+      <input id="api-base" type="url" placeholder="Backend URL (optional, e.g. http://127.0.0.1:8000)" />
       <button id="run">Crawl & Visualize</button>
+      <button id="run-full">Full Web Scan</button>
       <label><input id="overlay" type="checkbox" checked /> Run /fuzz overlay</label>
     </div>
     <div id="status" class="status"></div>
+    <div id="scan-panel" class="panel scan-panel" style="display:none">
+      <h3>Full Web Scan Summary</h3>
+      <div id="scan-meta" class="scan-meta"></div>
+      <div id="scan-actions" class="scan-actions"></div>
+      <div id="scan-findings" class="scan-findings"></div>
+    </div>
 
     <div class="layout">
       <div class="panel">
@@ -91,10 +118,56 @@
     const svgEl = document.getElementById("graph");
     const overlayEl = document.getElementById("overlay");
     const targetUrlEl = document.getElementById("target-url");
+    const apiBaseEl = document.getElementById("api-base");
+    const scanPanelEl = document.getElementById("scan-panel");
+    const scanMetaEl = document.getElementById("scan-meta");
+    const scanFindingsEl = document.getElementById("scan-findings");
+    const scanActionsEl = document.getElementById("scan-actions");
+    const API_BASE_STORAGE_KEY = "ai_secure_api_base";
     let currentGraph = null;
     let currentFuzz = null;
     let currentNodeVulns = new Map();
     let currentReflections = new Map();
+
+    function normalizeBaseUrl(value) {
+      const raw = String(value || "").trim();
+      if (!raw) return "";
+      return raw.replace(/\/+$/, "");
+    }
+
+    function getDefaultApiBase() {
+      const saved = normalizeBaseUrl(localStorage.getItem(API_BASE_STORAGE_KEY) || "");
+      if (saved) return saved;
+      if (window.location.protocol === "file:") return "http://127.0.0.1:8000";
+      return "";
+    }
+
+    function currentApiBase() {
+      return normalizeBaseUrl(apiBaseEl?.value || "");
+    }
+
+    function apiUrl(path) {
+      const base = currentApiBase();
+      if (!base) return path;
+      return `${base}${path}`;
+    }
+
+    function updateApiBaseFromInput() {
+      const normalized = normalizeBaseUrl(apiBaseEl?.value || "");
+      if (!apiBaseEl) return;
+      apiBaseEl.value = normalized;
+      if (normalized) {
+        localStorage.setItem(API_BASE_STORAGE_KEY, normalized);
+      } else {
+        localStorage.removeItem(API_BASE_STORAGE_KEY);
+      }
+    }
+
+    function buildUiUrl(path) {
+      const base = currentApiBase();
+      if (!base) return path;
+      return `${base}${path}`;
+    }
 
     function escapeHtml(value) {
       return String(value ?? "")
@@ -125,6 +198,146 @@
       }
       if (!res.ok) throw new Error(body.detail || "Request failed");
       return body;
+    }
+
+    function webScanToFuzzLike(scanData, fallbackTargetUrl = "") {
+      const findings = Array.isArray(scanData?.findings) ? scanData.findings : [];
+      const normalizedFindings = findings.map((f) => ({
+        ...f,
+        target_url: f.target_url || fallbackTargetUrl || ""
+      }));
+      return {
+        findings: normalizedFindings,
+        cross_page_reflections: Array.isArray(scanData?.cross_page_reflections)
+          ? scanData.cross_page_reflections
+          : []
+      };
+    }
+
+    function humanizeVulnerabilityName(type) {
+      const raw = String(type || "").trim();
+      if (!raw) return "Potential Issue";
+      const predefined = {
+        sql_injection: "SQL Injection",
+        xss: "Cross-Site Scripting (XSS)",
+        command_injection: "Command Injection",
+        path_traversal: "Path Traversal"
+      };
+      const key = raw.toLowerCase().replace(/\s+/g, "_");
+      if (predefined[key]) return predefined[key];
+      return raw
+        .replace(/[_-]+/g, " ")
+        .replace(/\b\w/g, (ch) => ch.toUpperCase());
+    }
+
+    function findingPayloadExamples(finding) {
+      if (Array.isArray(finding?.payload_examples) && finding.payload_examples.length) {
+        return finding.payload_examples.filter((p) => String(p || "").trim() !== "");
+      }
+      if (finding?.payload) return [finding.payload];
+      return [];
+    }
+
+    function renderFullScanSummary(scanData) {
+      if (!scanData || typeof scanData !== "object") {
+        scanPanelEl.style.display = "none";
+        return;
+      }
+      scanPanelEl.style.display = "block";
+      const reportId = String(scanData.report_id || "");
+      const score = Number(scanData.security_score ?? 0);
+      const grade = String(scanData.grade || "-");
+      const totalPages = Number(scanData.total_pages ?? 0);
+      const totalParams = Number(scanData.total_parameters ?? 0);
+      const totalFindings = Number(scanData.total_findings ?? 0);
+      const stored = Number(scanData.stored_vulnerability_candidates ?? 0);
+      const longest = scanData.longest_parameter_chain || {};
+      const longestLen = Number(longest.chain_length ?? 0);
+      const longestParam = String(longest.parameter || "-");
+
+      scanMetaEl.innerHTML = `
+        <div class="scan-tile"><div class="small">Security Score</div><b>${escapeHtml(score)}</b></div>
+        <div class="scan-tile"><div class="small">Grade</div><b>${escapeHtml(grade)}</b></div>
+        <div class="scan-tile"><div class="small">Pages</div><b>${escapeHtml(totalPages)}</b></div>
+        <div class="scan-tile"><div class="small">Parameters</div><b>${escapeHtml(totalParams)}</b></div>
+        <div class="scan-tile"><div class="small">Findings</div><b>${escapeHtml(totalFindings)}</b></div>
+        <div class="scan-tile"><div class="small">Stored Candidates</div><b>${escapeHtml(stored)}</b></div>
+        <div class="scan-tile"><div class="small">Longest Chain</div><b>${escapeHtml(longestLen)}</b></div>
+        <div class="scan-tile"><div class="small">Chain Parameter</div><b>${escapeHtml(longestParam)}</b></div>
+      `;
+
+      scanActionsEl.innerHTML = reportId
+        ? `
+            <a href="${escapeHtml(buildUiUrl(`/static/history.html?open=${encodeURIComponent(reportId)}`))}">View Report</a>
+            <a href="${escapeHtml(buildUiUrl(`/report/${encodeURIComponent(reportId)}/pdf`))}" target="_blank" rel="noopener">Download PDF</a>
+          `
+        : "";
+
+      const findings = Array.isArray(scanData.findings) ? scanData.findings : [];
+      if (!findings.length) {
+        scanFindingsEl.innerHTML = `<div class="small">No findings from full scan.</div>`;
+        return;
+      }
+      scanFindingsEl.innerHTML = findings.map((f) => {
+        const ai = f.ai_explanation || {};
+        const summary = ai.executive_summary ? String(ai.executive_summary) : "";
+        const mitigation = ai.recommended_mitigation ? String(ai.recommended_mitigation) : "";
+        const payloadExamples = findingPayloadExamples(f);
+        const vulnName = humanizeVulnerabilityName(f.vulnerability_type);
+        return `
+          <div class="vuln">
+            <div class="finding-title"><b>${escapeHtml(vulnName)}</b></div>
+            <div class="small">parameter: <code>${escapeHtml(f.parameter || "-")}</code></div>
+            <div class="finding-meta">
+              <span class="pill">CWE: ${escapeHtml(f.cwe_id || "-")}</span>
+              <span class="pill">OWASP: ${escapeHtml(f.owasp_category || "-")}</span>
+              <span class="pill">Severity: ${escapeHtml(f.severity || "Info")}</span>
+              <span class="pill">Confidence: ${escapeHtml(f.confidence_score ?? "-")}</span>
+            </div>
+            <details class="small">
+              <summary>Payload Examples (${escapeHtml(payloadExamples.length)})</summary>
+              ${
+                payloadExamples.length
+                  ? `<ul class="payload-list">${payloadExamples.map((p) => `<li><code>${escapeHtml(p)}</code></li>`).join("")}</ul>`
+                  : `<div>No payload examples.</div>`
+              }
+            </details>
+            ${
+              summary || mitigation
+                ? `
+                  <div class="ai-block">
+                    ${summary ? `<div class="small"><b>Executive Summary:</b> ${escapeHtml(summary)}</div>` : ""}
+                    ${mitigation ? `<div class="mitigation-box small"><b>Recommended Mitigation:</b> ${escapeHtml(mitigation)}</div>` : ""}
+                  </div>
+                `
+                : ""
+            }
+          </div>
+        `;
+      }).join("");
+    }
+
+    async function getFlowGraphFromReport(reportId, targetUrl) {
+      if (reportId) {
+        try {
+          const reportRes = await fetch(apiUrl(`/history/${encodeURIComponent(reportId)}`));
+          const reportData = await parseJsonResponse(reportRes);
+          const graph = reportData?.crawl_output?.flow_graph;
+          if (graph && Array.isArray(graph.nodes)) {
+            return graph;
+          }
+        } catch (_) {
+          // Fall back to direct crawl below.
+        }
+      }
+
+      const crawlRes = await fetch(apiUrl("/crawl"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ target_url: targetUrl })
+      });
+      const crawlData = await parseJsonResponse(crawlRes);
+      return crawlData.flow_graph || flowGraphFallback(crawlData);
     }
 
     function flowGraphFallback(crawlData) {
@@ -395,7 +608,7 @@
       currentReflections = new Map();
 
       try {
-        const crawlRes = await fetch("/crawl", {
+        const crawlRes = await fetch(apiUrl("/crawl"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ target_url: targetUrl })
@@ -406,7 +619,7 @@
 
         if (overlayEl.checked) {
           statusEl.textContent = "Running fuzz overlay...";
-          const fuzzRes = await fetch("/fuzz", {
+          const fuzzRes = await fetch(apiUrl("/fuzz"), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(crawlData)
@@ -430,9 +643,58 @@
       }
     }
 
+    async function runFullScan() {
+      const targetUrl = targetUrlEl.value.trim();
+      if (!targetUrl) {
+        statusEl.innerHTML = `<span class="err">Enter a target URL.</span>`;
+        return;
+      }
+
+      statusEl.textContent = "Running full website scan (crawl + fuzz + AI explanation)...";
+      detailsEl.textContent = "Loading full scan...";
+      scanPanelEl.style.display = "none";
+      currentFuzz = null;
+      currentNodeVulns = new Map();
+      currentReflections = new Map();
+
+      try {
+        const scanRes = await fetch(apiUrl("/scan-website"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ target_url: targetUrl })
+        });
+        const scanData = await parseJsonResponse(scanRes);
+        renderFullScanSummary(scanData);
+
+        const reportId = String(scanData.report_id || "");
+        currentGraph = await getFlowGraphFromReport(reportId, targetUrl);
+        currentFuzz = webScanToFuzzLike(scanData, targetUrl);
+        currentNodeVulns = buildNodeVulnerabilityMap(currentFuzz);
+        currentReflections = buildReflectionMap(currentFuzz);
+        renderGraph(currentGraph, currentFuzz);
+
+        const nodeCount = Array.isArray(currentGraph?.nodes) ? currentGraph.nodes.length : 0;
+        const edgeCount = Array.isArray(currentGraph?.edges) ? currentGraph.edges.length : 0;
+        const findingCount = Array.isArray(scanData?.findings) ? scanData.findings.length : 0;
+        statusEl.textContent = `Full scan complete: score=${scanData.security_score}, grade=${scanData.grade}, ${nodeCount} nodes, ${edgeCount} edges, ${findingCount} findings.`;
+      } catch (err) {
+        statusEl.innerHTML = `<span class="err">Full scan failed: ${escapeHtml(err.message || err)}</span>`;
+        detailsEl.textContent = "Unable to render full scan results.";
+      }
+    }
+
     document.getElementById("run").addEventListener("click", runFlow);
+    document.getElementById("run-full").addEventListener("click", runFullScan);
+    apiBaseEl.addEventListener("change", updateApiBaseFromInput);
+    apiBaseEl.addEventListener("blur", updateApiBaseFromInput);
     targetUrlEl.addEventListener("keydown", (e) => { if (e.key === "Enter") runFlow(); });
     window.addEventListener("resize", () => { if (currentGraph) renderGraph(currentGraph, currentFuzz); });
+
+    apiBaseEl.value = getDefaultApiBase();
+    updateApiBaseFromInput();
+    if (window.location.protocol === "file:") {
+      statusEl.textContent = "Set Backend URL (default http://127.0.0.1:8000) and keep FastAPI running.";
+    }
   </script>
 </body>
 </html>

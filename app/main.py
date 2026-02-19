@@ -1,5 +1,9 @@
+import asyncio
+import json
+import os
+from datetime import datetime
 from io import BytesIO
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from fastapi import (
     BackgroundTasks,
@@ -25,6 +29,7 @@ from app.fuzzing_engine import fuzz_from_crawler_output
 from app.llm_service import enrich_vulnerabilities, explain_attack_finding
 from app.pdf_service import generate_pdf
 from app.utils import validate_github_url, download_github_repo, cleanup_temp_directory
+from app.vulnerability_taxonomy import get_vulnerability_taxonomy
 
 
 class ScanRepoRequest(BaseModel):
@@ -42,7 +47,13 @@ class AttackExplanationResponse(BaseModel):
     recommended_mitigation: str
 
 
+class ScanWebsiteRequest(BaseModel):
+    target_url: str
+
+
 app = FastAPI()
+MAX_AI_EXPLANATIONS_PER_SCAN = 5
+AI_EXPLANATION_MIN_INTERVAL_SECONDS = 0.25
 
 # CORS - allow configured origins in production, default to localhost for dev
 app.add_middleware(
@@ -102,6 +113,323 @@ async def _get_reports_collection_or_503():
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Database unavailable",
         ) from exc
+
+
+def _web_grade_from_score(score: int) -> str:
+    if score >= 90:
+        return "A"
+    if score >= 75:
+        return "B"
+    if score >= 60:
+        return "C"
+    if score >= 40:
+        return "D"
+    return "F"
+
+
+def _has_openai_api_key() -> bool:
+    key = str(os.getenv("OPENAI_API_KEY") or "").strip()
+    if not key:
+        return False
+    return key.lower() != "your_openai_api_key_here"
+
+
+def _fallback_explanation_for_finding(
+    finding: Dict[str, Any], reason: str = ""
+) -> Dict[str, str]:
+    vulnerability_type = str(finding.get("vulnerability_type") or "Potential issue").strip()
+    taxonomy = get_vulnerability_taxonomy(vulnerability_type)
+    owasp = taxonomy.get("owasp_category") or "Unmapped OWASP category"
+    cwe = taxonomy.get("cwe_id") or "Unmapped CWE"
+
+    normalized = vulnerability_type.lower()
+    if "sql" in normalized:
+        mitigation = (
+            "Use parameterized queries/prepared statements, enforce strict input validation, "
+            "and avoid building SQL from raw user input."
+        )
+    elif "xss" in normalized or "cross site" in normalized:
+        mitigation = (
+            "Apply contextual output encoding, sanitize untrusted input, and enforce a strict "
+            "Content Security Policy (CSP)."
+        )
+    elif "command" in normalized:
+        mitigation = (
+            "Avoid shell invocation with untrusted input, use allowlists, and execute commands "
+            "through safe APIs with strict argument handling."
+        )
+    elif "path" in normalized and "travers" in normalized:
+        mitigation = (
+            "Normalize and validate filesystem paths, enforce directory allowlists, and block "
+            "relative traversal sequences."
+        )
+    else:
+        mitigation = (
+            "Validate and constrain input, enforce safe output handling, and harden server-side "
+            "error handling and access controls."
+        )
+
+    reason_suffix = f" ({reason})" if reason else ""
+    return {
+        "executive_summary": (
+            f"Automated analysis indicates a potential {vulnerability_type} finding{reason_suffix}."
+        ),
+        "technical_explanation": (
+            f"The detection signals for this finding suggest behavior consistent with {vulnerability_type}. "
+            f"Taxonomy mapping: {owasp}, {cwe}."
+        ),
+        "exploitation_scenario": (
+            "An attacker may manipulate user-controlled input to trigger unintended server behavior "
+            "or expose sensitive application logic."
+        ),
+        "recommended_mitigation": mitigation,
+    }
+
+
+def _unique_keep_order(values: List[Any]) -> List[Any]:
+    seen: set[str] = set()
+    output: List[Any] = []
+    for value in values:
+        try:
+            key = json.dumps(value, sort_keys=True, ensure_ascii=True)
+        except Exception:
+            key = str(value)
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(value)
+    return output
+
+
+def _merge_signal_values(values: List[Any]) -> Any:
+    valid = [value for value in values if value is not None]
+    if not valid:
+        return None
+
+    if all(isinstance(value, bool) for value in valid):
+        return any(valid)
+
+    if all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in valid):
+        return max(valid)
+
+    if all(isinstance(value, dict) for value in valid):
+        merged: Dict[str, Any] = {}
+        all_keys = set().union(*(value.keys() for value in valid))
+        for key in all_keys:
+            merged_value = _merge_signal_values(
+                [value.get(key) for value in valid if key in value]
+            )
+            if merged_value is not None:
+                merged[key] = merged_value
+        return merged
+
+    if all(isinstance(value, list) for value in valid):
+        merged_list: List[Any] = []
+        for value in valid:
+            merged_list.extend(value)
+        return _unique_keep_order(merged_list)
+
+    return valid[0]
+
+
+def _merge_detection_signals(signals_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+    valid = [signals for signals in signals_list if isinstance(signals, dict)]
+    if not valid:
+        return {}
+
+    merged: Dict[str, Any] = {}
+    all_keys = set().union(*(signals.keys() for signals in valid))
+    for key in all_keys:
+        merged_value = _merge_signal_values(
+            [signals.get(key) for signals in valid if key in signals]
+        )
+        if merged_value is not None:
+            merged[key] = merged_value
+    return merged
+
+
+def _deduplicate_scan_findings(findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    grouped: Dict[tuple[str, str, str], List[Dict[str, Any]]] = {}
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        target_url = str(finding.get("target_url") or "").strip()
+        parameter = str(finding.get("parameter") or "").strip()
+        vulnerability_type = str(finding.get("vulnerability_type") or "Potential issue").strip()
+        group_key = (target_url, parameter, vulnerability_type.lower())
+        grouped.setdefault(group_key, []).append(finding)
+
+    deduplicated: List[Dict[str, Any]] = []
+    for group in grouped.values():
+        ranked = sorted(
+            group,
+            key=lambda item: float(item.get("confidence_score") or 0.0),
+            reverse=True,
+        )
+        base = dict(ranked[0])
+
+        payload_examples_raw: List[str] = []
+        for item in ranked:
+            payload = str(item.get("payload") or "").strip()
+            if payload:
+                payload_examples_raw.append(payload)
+            existing_examples = item.get("payload_examples") or []
+            if isinstance(existing_examples, list):
+                for example in existing_examples:
+                    text = str(example or "").strip()
+                    if text:
+                        payload_examples_raw.append(text)
+        payload_examples = _unique_keep_order(payload_examples_raw)
+
+        if payload_examples:
+            base["payload_examples"] = payload_examples
+            if not str(base.get("payload") or "").strip():
+                base["payload"] = payload_examples[0]
+
+        base["stored_vulnerability_candidate"] = any(
+            bool(item.get("stored_vulnerability_candidate")) for item in ranked
+        )
+        base["detection_signals"] = _merge_detection_signals(
+            [item.get("detection_signals") for item in ranked]
+        )
+
+        if any(isinstance(item.get("flow_chain_evidence"), list) for item in ranked):
+            chains: List[Any] = []
+            for item in ranked:
+                evidence = item.get("flow_chain_evidence")
+                if isinstance(evidence, list):
+                    chains.extend(evidence)
+            base["flow_chain_evidence"] = _unique_keep_order(chains)
+
+        deduplicated.append(base)
+
+    deduplicated.sort(
+        key=lambda item: float(item.get("confidence_score") or 0.0),
+        reverse=True,
+    )
+    return deduplicated
+
+
+def _finding_penalty(finding: Dict[str, Any]) -> float:
+    severity = str(finding.get("severity") or "Info").strip().lower()
+    confidence = float(finding.get("confidence_score") or 0.0)
+    base = {
+        "info": 2.0,
+        "low": 8.0,
+        "medium": 18.0,
+        "high": 30.0,
+    }.get(severity, 4.0)
+
+    penalty = base * max(0.0, min(1.0, confidence))
+    if bool(finding.get("stored_vulnerability_candidate")):
+        penalty += 8.0
+    return penalty
+
+
+def _calculate_web_security_score(findings: List[Dict[str, Any]]) -> int:
+    if not findings:
+        return 100
+    total_penalty = sum(_finding_penalty(item) for item in findings)
+    score = max(0.0, 100.0 - total_penalty)
+    return int(round(score))
+
+
+def _empty_explanation(message: str) -> Dict[str, str]:
+    return {
+        "executive_summary": message,
+        "technical_explanation": "Explanation unavailable.",
+        "exploitation_scenario": "Not available.",
+        "recommended_mitigation": "Review logs and retry explanation generation.",
+    }
+
+
+async def _attach_attack_explanations(
+    findings: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not findings:
+        return []
+
+    openai_key_exists = _has_openai_api_key()
+    ai_calls_attempted = 0
+    results: List[Dict[str, Any]] = []
+
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+
+        output = dict(finding)
+
+        if not openai_key_exists:
+            output["ai_explanation"] = _fallback_explanation_for_finding(
+                output, reason="OPENAI_API_KEY missing"
+            )
+            results.append(output)
+            continue
+
+        if ai_calls_attempted >= MAX_AI_EXPLANATIONS_PER_SCAN:
+            output["ai_explanation"] = _fallback_explanation_for_finding(
+                output, reason=f"AI call cap reached ({MAX_AI_EXPLANATIONS_PER_SCAN})"
+            )
+            results.append(output)
+            continue
+
+        try:
+            if ai_calls_attempted > 0:
+                await asyncio.sleep(AI_EXPLANATION_MIN_INTERVAL_SECONDS)
+            ai_calls_attempted += 1
+            output["ai_explanation"] = await explain_attack_finding(output)
+        except Exception as exc:
+            output["ai_explanation"] = _fallback_explanation_for_finding(
+                output, reason=f"LLM unavailable: {exc}"
+            )
+
+        results.append(output)
+
+    return results
+
+
+def _finding_to_pdf_vulnerability(finding: Dict[str, Any]) -> Dict[str, str]:
+    vuln_type = str(finding.get("vulnerability_type") or "Potential vulnerability")
+    parameter = str(finding.get("parameter") or "unknown")
+    severity = str(finding.get("severity") or "Info")
+    explanation = finding.get("ai_explanation") or {}
+    recommended_fix = (
+        str(explanation.get("recommended_mitigation") or "").strip()
+        if isinstance(explanation, dict)
+        else ""
+    )
+    if not recommended_fix:
+        recommended_fix = "Validate inputs, encode outputs, and use least-privilege defaults."
+    return {
+        "issue": f"{vuln_type} on parameter {parameter}",
+        "severity": severity,
+        "recommended_fix": recommended_fix,
+    }
+
+
+def _web_response_findings(findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    output: List[Dict[str, Any]] = []
+    for finding in findings:
+        vulnerability_type = str(finding.get("vulnerability_type") or "Potential issue")
+        taxonomy = get_vulnerability_taxonomy(vulnerability_type)
+        output.append(
+            {
+                "target_url": str(finding.get("target_url") or ""),
+                "parameter": str(finding.get("parameter") or ""),
+                "payload": str(finding.get("payload") or ""),
+                "payload_examples": finding.get("payload_examples") or [],
+                "vulnerability_type": vulnerability_type,
+                "owasp_category": taxonomy["owasp_category"],
+                "cwe_id": taxonomy["cwe_id"],
+                "severity": str(finding.get("severity") or "Info"),
+                "confidence_score": float(finding.get("confidence_score") or 0.0),
+                "stored_vulnerability_candidate": bool(
+                    finding.get("stored_vulnerability_candidate")
+                ),
+                "ai_explanation": finding.get("ai_explanation"),
+            }
+        )
+    return output
 
 
 @app.get("/")
@@ -342,6 +670,123 @@ async def fuzz_endpoint(crawler_output: Dict[str, Any]):
         ) from exc
 
 
+@app.post("/scan-website")
+async def scan_website_endpoint(request: ScanWebsiteRequest):
+    target_url = (request.target_url or "").strip()
+    if not target_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="target_url is required",
+        )
+
+    try:
+        crawler_output = await crawl_site(target_url, max_depth=2)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except Exception as exc:
+        print(f"Crawl error: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to crawl target URL",
+        ) from exc
+
+    try:
+        fuzz_output = await fuzz_from_crawler_output(crawler_output)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except Exception as exc:
+        print(f"Fuzzing error: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to execute fuzzing engine",
+        ) from exc
+
+    raw_findings = [
+        item for item in (fuzz_output.get("findings") or []) if isinstance(item, dict)
+    ]
+    deduplicated_findings = _deduplicate_scan_findings(raw_findings)
+    findings_with_explanations = await _attach_attack_explanations(deduplicated_findings)
+
+    total_pages = int(
+        crawler_output.get("pages_crawled")
+        or len(crawler_output.get("pages") or [])
+    )
+    total_parameters = int(
+        (crawler_output.get("summary") or {}).get("total_fuzz_parameters")
+        or fuzz_output.get("total_parameters_received")
+        or len(crawler_output.get("fuzz_parameters") or [])
+    )
+    total_findings = len(findings_with_explanations)
+    stored_candidates = int(fuzz_output.get("stored_vulnerability_candidates") or 0)
+    longest_parameter_chain = fuzz_output.get("longest_parameter_chain") or {}
+    cross_page_reflections = fuzz_output.get("cross_page_reflections") or []
+
+    security_score = _calculate_web_security_score(findings_with_explanations)
+    grade = _web_grade_from_score(security_score)
+
+    web_response_findings = _web_response_findings(findings_with_explanations)
+    report_data = {
+        "type": "web",
+        "target_url": crawler_output.get("target_url") or target_url,
+        "timestamp": datetime.utcnow(),
+        "score": security_score,
+        "grade": grade,
+        "total_files": total_pages,
+        "total_vulnerabilities": total_findings,
+        "total_pages": total_pages,
+        "total_parameters": total_parameters,
+        "stored_vulnerability_candidates": stored_candidates,
+        "longest_parameter_chain": longest_parameter_chain,
+        "cross_page_reflections": cross_page_reflections,
+        "findings": findings_with_explanations,
+        "vulnerabilities": [
+            _finding_to_pdf_vulnerability(item) for item in findings_with_explanations
+        ],
+        "crawl_output": crawler_output,
+        "fuzz_output": fuzz_output,
+    }
+
+    reports_collection = await _get_reports_collection_or_503()
+    try:
+        insert_res = await reports_collection.insert_one(report_data)
+        report_id = str(insert_res.inserted_id)
+    except Exception as exc:
+        print(f"Database insert error: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database unavailable",
+        ) from exc
+
+    try:
+        await generate_pdf(report_data)
+    except Exception as exc:
+        print(f"PDF generation error: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate PDF",
+        ) from exc
+
+    return {
+        "report_id": report_id,
+        "target_url": crawler_output.get("target_url") or target_url,
+        "security_score": security_score,
+        "grade": grade,
+        "total_pages": total_pages,
+        "total_parameters": total_parameters,
+        "total_findings": total_findings,
+        "stored_vulnerability_candidates": stored_candidates,
+        "longest_parameter_chain": longest_parameter_chain,
+        "cross_page_reflections": cross_page_reflections,
+        "findings": web_response_findings,
+    }
+
+
 @app.post("/explain-attack", response_model=AttackExplanationResponse)
 async def explain_attack_endpoint(payload: Dict[str, Any]):
     if not payload:
@@ -368,7 +813,7 @@ async def explain_attack_endpoint(payload: Dict[str, Any]):
         detail = str(exc) or "Failed to generate attack explanation"
         status_code = (
             status.HTTP_503_SERVICE_UNAVAILABLE
-            if "OPENAI_API_KEY" in detail
+            if "GROQ_API_KEY" in detail
             else status.HTTP_502_BAD_GATEWAY
         )
         raise HTTPException(status_code=status_code, detail=detail) from exc

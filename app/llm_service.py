@@ -7,7 +7,7 @@ import httpx
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODEL_NAME = os.getenv("MODEL_NAME", "llama3-70b-8192")
+MODEL_NAME = os.getenv("MODEL_NAME", "llama-3.3-70b-versatile")
 ATTACK_EXPLANATION_KEYS = (
     "executive_summary",
     "technical_explanation",
@@ -17,12 +17,12 @@ ATTACK_EXPLANATION_KEYS = (
 
 
 async def enrich_vulnerabilities(report_id: str, vulnerabilities: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Call OpenAI to enrich each vulnerability with an explanation and example fix.
+    """Call Groq chat completions to enrich vulnerabilities.
 
     Returns a dict of enrichments or None if API key missing or error.
     """
     if not GROQ_API_KEY:
-        print("OPENAI_API_KEY not set; skipping LLM enrichment")
+        print("GROQ_API_KEY not set; skipping LLM enrichment")
         return None
 
     async with httpx.AsyncClient(timeout=15.0) as client:
@@ -37,9 +37,12 @@ async def enrich_vulnerabilities(report_id: str, vulnerabilities: List[Dict[str,
             try:
                 resp = await client.post(
                     GROQ_API_URL,
-                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                    headers={
+                        "Authorization": f"Bearer {GROQ_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
                     json={
-                        "model": "llama3-70b-8192",
+                        "model": MODEL_NAME,
                         "messages": [{"role": "user", "content": prompt}],
                         "max_tokens": 300,
                     },
@@ -61,9 +64,12 @@ async def enrich_vulnerabilities(report_id: str, vulnerabilities: List[Dict[str,
             )
             resp2 = await client.post(
                 GROQ_API_URL,
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
                 json={
-                    "model": "llama3-70b-8192",
+                    "model": MODEL_NAME,
                     "messages": [{"role": "user", "content": summary_prompt}],
                     "max_tokens": 150,
                 },
@@ -105,6 +111,25 @@ def _extract_json_object(raw_text: str) -> Optional[Dict[str, Any]]:
         return parsed if isinstance(parsed, dict) else None
     except Exception:
         return None
+
+
+def _extract_api_error_text(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            err = payload.get("error")
+            if isinstance(err, dict):
+                message = str(err.get("message") or "").strip()
+                code = str(err.get("code") or "").strip()
+                if message and code:
+                    return f"{message} (code={code})"
+                if message:
+                    return message
+        raw = (response.text or "").strip()
+        return raw[:400] if raw else "Unknown error"
+    except Exception:
+        raw = (response.text or "").strip()
+        return raw[:400] if raw else "Unknown error"
 
 
 def _prepare_finding_for_prompt(finding: Dict[str, Any]) -> Dict[str, Any]:
@@ -167,19 +192,26 @@ async def explain_attack_finding(finding: Dict[str, Any]) -> Dict[str, str]:
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.1,
         "max_tokens": 500,
-        "response_format": {"type": "json_object"},
     }
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
             response = await client.post(
                 GROQ_API_URL,
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
                 json=request_json,
             )
             response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = _extract_api_error_text(exc.response)
+            raise RuntimeError(
+                f"GROQ request failed: HTTP {exc.response.status_code} - {detail}"
+            ) from exc
         except Exception as exc:
-            raise RuntimeError("GROQ request failed.") from exc
+            raise RuntimeError(f"GROQ request failed: {exc}") from exc
 
     content = (
         response.json()
