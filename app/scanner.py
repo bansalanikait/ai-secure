@@ -27,20 +27,24 @@ IGNORE_DIRS = {'node_modules', '.git', 'venv', 'build', 'dist', '__pycache__', '
 
 
 async def scan_code(code: str) -> Dict[str, Any]:
-    """Scan code string and return security score, grade, and vulnerabilities."""
-    vulnerabilities: List[Dict[str, str]] = []
+    """Scan code string and return security score, grade, and vulnerabilities with line numbers."""
+    vulnerabilities: List[Dict[str, Any]] = []
     score = 100
+    lines = code.split('\n')
 
     for rule in RULES:
         try:
-            if re.search(rule["pattern"], code, re.IGNORECASE):
-                vulnerabilities.append({
-                    "id": rule["id"],
-                    "issue": rule["name"],
-                    "severity": rule["severity"],
-                    "recommended_fix": rule["fix"]
-                })
-                score -= SEVERITY_PENALTY.get(rule["severity"], 0)
+            for line_idx, line in enumerate(lines, start=1):
+                if re.search(rule["pattern"], line, re.IGNORECASE):
+                    vulnerabilities.append({
+                        "id": rule["id"],
+                        "line": line_idx,
+                        "code": line.strip(),
+                        "issue": rule["name"],
+                        "severity": rule["severity"],
+                        "recommended_fix": rule["fix"]
+                    })
+                    score -= SEVERITY_PENALTY.get(rule["severity"], 0)
         except re.error:
             continue
 
