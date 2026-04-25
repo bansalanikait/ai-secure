@@ -7,6 +7,7 @@ from typing import Any, Dict, List
 
 from fastapi import (
     BackgroundTasks,
+    Body,
     FastAPI,
     File,
     HTTPException,
@@ -648,7 +649,15 @@ async def crawl_endpoint(request: CrawlRequest):
 
 
 @app.post("/fuzz")
-async def fuzz_endpoint(crawler_output: Dict[str, Any]):
+async def fuzz_endpoint(request: Request):
+    try:
+        crawler_output = await request.json()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid JSON",
+        ) from exc
+
     if not crawler_output:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
